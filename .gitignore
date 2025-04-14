@@ -1,0 +1,11 @@
+*.pdf
+*.epub
+*.png
+*.jpg
+*.jpeg
+erase.py
+run.py
+epubs/
+pdfs/
+contenido_extraido/
+temp_kindle_conversion/
