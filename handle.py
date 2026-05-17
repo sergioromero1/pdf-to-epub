@@ -15,8 +15,11 @@ Uso:
   py handle.py "C:/ruta/completa.pdf"  → Convierte un PDF con ruta absoluta
 """
 
+from __future__ import annotations
+
 import sys
 import re
+import io
 from pathlib import Path
 
 # Forzar salida UTF-8 en consolas Windows (cp1252)
@@ -24,6 +27,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import fitz  # PyMuPDF
 from ebooklib import epub
+from PIL import Image
 
 # ──────────────────────────────────────────────────────────────────────
 #  Rutas del proyecto
