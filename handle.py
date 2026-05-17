@@ -102,6 +102,9 @@ def _detectar_encabezados_repetidos(documento: fitz.Document,
     return {txt for txt, n in conteo.items() if n >= umbral_repeticion}
 
 
+import re
+import fitz
+
 def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                          margen_inferior: float,
                          tamano_cuerpo: float = 10.0,
@@ -109,14 +112,11 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                          encabezados_repetidos: set[str] | None = None,
                          num_pagina: int = 0,
                          min_img_px: int = 50,
-                         ) -> str:
+                         ) -> tuple[list[tuple[str, str, float, bool]], float]:
     """
-    Extrae texto e imágenes de una página.  Los títulos de capítulo se
-    marcan con ``## `` y las imágenes con ``{{IMG:pNN_xref}}``.
-
-    Args:
-        num_pagina:  Número de página (para generar id de imagen).
-        min_img_px:  Tamaño mínimo en px para incluir una imagen.
+    Extrae elementos crudos de la página junto con el margen base.
+    Devuelve: (lista_de_elementos, base_x0)
+    Cada elemento es: (tipo, contenido, x0, es_titulo)
     """
     if encabezados_repetidos is None:
         encabezados_repetidos = set()
@@ -128,9 +128,7 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
 
     dic = pagina.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_IMAGES)
 
-    # ── Recopilar elementos ordenados por posición Y ──
-    # Cada elemento: (y_centro, tipo, contenido)
-    elementos: list[tuple[float, str, str]] = []
+    elementos_raw = []
 
     for bloque in dic.get("blocks", []):
         bbox = bloque["bbox"]
@@ -142,20 +140,16 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
         y_centro = (y_sup + y_inf) / 2
 
         if bloque.get("type", 0) == 1:
-            # Bloque de imagen
             ancho = bloque.get("width", 0)
             alto = bloque.get("height", 0)
             if ancho >= min_img_px and alto >= min_img_px:
-                # Buscar el xref de la imagen más cercana a este bbox
                 img_list = pagina.get_images(full=True)
                 mejor_xref = None
                 mejor_dist = float("inf")
                 for img_info in img_list:
                     xref = img_info[0]
-                    try:
-                        rects = pagina.get_image_rects(xref)
-                    except Exception:
-                        continue
+                    try: rects = pagina.get_image_rects(xref)
+                    except Exception: continue
                     for r in rects:
                         dist = abs(r.y0 - y_sup) + abs(r.x0 - bbox[0])
                         if dist < mejor_dist:
@@ -163,10 +157,9 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                             mejor_xref = xref
                 if mejor_xref is not None:
                     img_id = f"p{num_pagina:04d}_{mejor_xref}"
-                    elementos.append((y_centro, "img", img_id))
+                    elementos_raw.append((y_centro, "img", f"{{{{IMG:{img_id}}}}}", 0.0, False))
             continue
 
-        # Bloque de texto
         for linea in bloque.get("lines", []):
             textos_linea = []
             tamano_max = 0.0
@@ -184,40 +177,31 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                 continue
 
             tiene_palabras = len(re.findall(r"[a-zA-Z\u00c0-\u024f]{2,}", texto_completo)) >= 1
-            es_mayus_decorativo = (
-                texto_completo == texto_completo.upper()
-                and len(texto_completo.split()) <= 2
-            )
-            tiene_chars_raros = bool(re.search(
-                r"[^\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2032-\u2037\u2018-\u201f]",
-                texto_completo
-            ))
-            es_titulo_por_fuente = (
-                tamano_max >= umbral_titulo
-                and len(texto_completo) < 120
-                and tiene_palabras
-                and not es_mayus_decorativo
-                and not tiene_chars_raros
-            )
+            es_mayus_decorativo = (texto_completo == texto_completo.upper() and len(texto_completo.split()) <= 2)
+            tiene_chars_raros = bool(re.search(r"[^\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2032-\u2037\u2018-\u201f]", texto_completo))
+            es_titulo_por_fuente = (tamano_max >= umbral_titulo and len(texto_completo) < 120 and tiene_palabras and not es_mayus_decorativo and not tiene_chars_raros)
 
+            x0_linea = linea["bbox"][0]
             y_linea = linea["bbox"][1]
+            
             if es_titulo_por_fuente:
-                elementos.append((y_linea, "txt", f"## {texto_completo}"))
+                elementos_raw.append((y_linea, "titulo", f"## {texto_completo}", x0_linea, True))
             elif texto_completo.lower() in encabezados_repetidos:
                 continue
             else:
-                elementos.append((y_linea, "txt", texto_completo))
+                elementos_raw.append((y_linea, "txt", texto_completo, x0_linea, False))
 
-    # Ordenar por posición Y y generar salida
-    elementos.sort(key=lambda e: e[0])
-    lineas_resultado = []
-    for _y, tipo, contenido in elementos:
-        if tipo == "img":
-            lineas_resultado.append(f"{{{{IMG:{contenido}}}}}")
-        else:
-            lineas_resultado.append(contenido)
+    # Ordenar verticalmente los elementos de esta página
+    elementos_raw.sort(key=lambda e: e[0])
+    
+    # Calcular el margen base izquierdo de ESTA página
+    lineas_cuerpo = [e for e in elementos_raw if e[1] == "txt" and not e[4] and len(e[2]) > 15]
+    base_x0 = min([e[3] for e in lineas_cuerpo]) if lineas_cuerpo else 0.0
 
-    return "\n".join(lineas_resultado)
+    # Limpiar la tupla para devolver solo lo necesario: (tipo, contenido, x0, es_titulo)
+    elementos_finales = [(e[1], e[2], e[3], e[4]) for e in elementos_raw]
+
+    return elementos_finales, base_x0
 
 
 def extraer_imagenes_pdf(ruta_pdf: Path,
@@ -261,36 +245,78 @@ def extraer_texto_pdf(ruta_pdf: Path,
                       margen_superior: float = 0.08,
                       margen_inferior: float = 0.08) -> tuple[list[str], dict[str, tuple[bytes, str]]]:
     """
-    Abre un PDF y extrae texto + imágenes.
-
-    Returns:
-        (paginas_texto, imagenes)
-        - paginas_texto: lista de textos por página con marcas ## e {{IMG:...}}
-        - imagenes: dict img_id → (bytes, ext)
+    Abre un PDF, une todas las páginas de forma fluida resolviendo cortes 
+    de párrafo en saltos de página, y extrae las imágenes.
     """
     documento = fitz.open(str(ruta_pdf))
 
     tamano_cuerpo = _calcular_tamano_cuerpo(documento)
     encabezados_rep = _detectar_encabezados_repetidos(documento)
 
-    paginas_texto = []
+    # Aquí acumularemos los elementos de TODO el libro en orden continuo
+    # Formato de la tupla: (tipo, contenido, es_sangria)
+    flujo_global_elementos = []
+    
     for numero in range(len(documento)):
         pagina = documento[numero]
-        texto = extraer_texto_pagina(
+        elementos_pag, base_x0 = extraer_texto_pagina(
             pagina, margen_superior, margen_inferior,
             tamano_cuerpo=tamano_cuerpo,
             encabezados_repetidos=encabezados_rep,
             num_pagina=numero,
         )
-        if texto.strip():
-            paginas_texto.append(texto)
+        
+        # Procesamos los elementos de la página usando su propio base_x0
+        for tipo, contenido, x0, es_titulo in elementos_pag:
+            if tipo == "txt":
+                umbral_sangria = 8.0
+                es_sangria = (x0 - base_x0) > umbral_sangria
+                flujo_global_elementos.append((tipo, contenido, es_sangria))
+            else:
+                # Títulos e imágenes no requieren cálculo de sangría
+                flujo_global_elementos.append((tipo, contenido, False))
 
     documento.close()
 
-    # Extraer imágenes en pasada separada (más fiable)
+    # ── Reconstrucción global de párrafos (Omitiendo fronteras de página) ──
+    bloques_finales = []
+    parrafo_actual = []
+
+    for tipo, contenido, es_sangria in flujo_global_elementos:
+        if tipo == "img":
+            if parrafo_actual:
+                bloques_finales.append(" ".join(parrafo_actual))
+                parrafo_actual = []
+            bloques_finales.append(contenido)
+            
+        elif tipo == "titulo":
+            if parrafo_actual:
+                bloques_finales.append(" ".join(parrafo_actual))
+                parrafo_actual = []
+            bloques_finales.append(contenido)
+            
+        else:  # tipo == "txt"
+            # Si la línea tiene sangría, cerramos el párrafo anterior e iniciamos uno nuevo
+            if es_sangria:
+                if parrafo_actual:
+                    bloques_finales.append(" ".join(parrafo_actual))
+                    parrafo_actual = []
+            
+            # Unimos las líneas pertenecientes al mismo párrafo con un espacio en blanco
+            parrafo_actual.append(contenido)
+
+    # Guardar el último párrafo del libro
+    if parrafo_actual:
+        bloques_finales.append(" ".join(parrafo_actual))
+
+    # Generamos el Markdown unificado con doble salto de línea
+    markdown_completo = "\n\n".join(bloques_finales)
+
+    # Extraer imágenes en pasada separada
     imagenes = extraer_imagenes_pdf(ruta_pdf)
 
-    return paginas_texto, imagenes
+    # Devolvemos el markdown completo dentro de la lista
+    return [markdown_completo], imagenes
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -484,6 +510,9 @@ def markdown_a_html(texto_md: str,
         if linea.startswith("## "):
             cerrar_parrafo()
             html_partes.append(f"<h2>{linea[3:].strip()}</h2>")
+        elif linea.startswith("### "):
+            cerrar_parrafo()
+            html_partes.append(f"<h3>{linea[4:].strip()}</h3>")
         elif patron_img.fullmatch(linea):
             cerrar_parrafo()
             html_partes.append(_img_tag(patron_img.fullmatch(linea).group(1)))
