@@ -19,7 +19,11 @@ Uso:
 
 import sys
 import re
+import io
 from pathlib import Path
+
+# Forzar salida UTF-8 en consolas Windows (cp1252)
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import fitz  # PyMuPDF
 from ebooklib import epub
@@ -33,77 +37,260 @@ DIRECTORIO_BASE = Path(__file__).parent
 DIRECTORIO_PDF = DIRECTORIO_BASE / "PDF"
 DIRECTORIO_SALIDA = DIRECTORIO_BASE / "epub-mobi" / "modificados"
 DIRECTORIO_CARATULAS = DIRECTORIO_BASE / "caratulas"
+DIRECTORIO_MD = DIRECTORIO_BASE / "md"
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PASO 1 — Extracción inteligente del texto
 # ══════════════════════════════════════════════════════════════════════
 
-def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
-                         margen_inferior: float) -> str:
+def _calcular_tamano_cuerpo(documento: fitz.Document,
+                            max_paginas_muestra: int = 40) -> float:
     """
-    Extrae texto de una página descartando bloques que estén dentro de
-    las zonas de encabezado (margen superior) o pie de página (margen
-    inferior).  Esto elimina automáticamente números de página,
-    encabezados repetidos y otros artefactos de impresión.
-
-    Args:
-        pagina:           Objeto Page de PyMuPDF.
-        margen_superior:  Fracción de la altura de la página que se
-                          considera zona de encabezado (ej. 0.06 = 6%).
-        margen_inferior:  Fracción de la altura que se considera zona
-                          de pie de página (ej. 0.06 = 6%).
+    Calcula el tamaño de fuente del cuerpo del texto analizando las
+    páginas del documento.  Se toma el tamaño de fuente más frecuente
+    como referencia del cuerpo.
 
     Returns:
-        Texto limpio de la página como cadena.
+        Tamaño de fuente (en pt) más utilizado en el documento.
     """
+    from collections import Counter
+    conteo: Counter = Counter()
+
+    paso = max(1, len(documento) // max_paginas_muestra)
+    for num_pag in range(0, len(documento), paso):
+        pagina = documento[num_pag]
+        dic = pagina.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        for bloque in dic.get("blocks", []):
+            for linea in bloque.get("lines", []):
+                for span in linea.get("spans", []):
+                    texto = span["text"].strip()
+                    if len(texto) > 3:  # ignorar fragmentos muy cortos
+                        tam = round(span["size"], 1)
+                        conteo[tam] += len(texto)
+
+    if not conteo:
+        return 10.0  # valor por defecto razonable
+    return conteo.most_common(1)[0][0]
+
+
+def _detectar_encabezados_repetidos(documento: fitz.Document,
+                                    margen_encabezado_y: float = 55,
+                                    umbral_repeticion: int = 4
+                                    ) -> set[str]:
+    """
+    Identifica textos que aparecen repetidamente en la zona de
+    encabezado de las páginas (running headers).  Estos textos se
+    eliminarán durante la extracción para no ensuciar el contenido.
+
+    Returns:
+        Conjunto de textos en minúsculas considerados running headers.
+    """
+    from collections import Counter
+    conteo: Counter = Counter()
+
+    for num_pag in range(len(documento)):
+        pagina = documento[num_pag]
+        bloques = pagina.get_text("blocks")
+        for b in bloques:
+            y_sup, y_inf = b[1], b[3]
+            if y_inf < margen_encabezado_y and b[6] == 0:
+                texto = b[4].strip()
+                if texto:
+                    conteo[texto.lower()] += 1
+
+    return {txt for txt, n in conteo.items() if n >= umbral_repeticion}
+
+
+def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
+                         margen_inferior: float,
+                         tamano_cuerpo: float = 10.0,
+                         factor_titulo: float = 1.4,
+                         encabezados_repetidos: set[str] | None = None,
+                         num_pagina: int = 0,
+                         min_img_px: int = 50,
+                         ) -> str:
+    """
+    Extrae texto e imágenes de una página.  Los títulos de capítulo se
+    marcan con ``## `` y las imágenes con ``{{IMG:pNN_xref}}``.
+
+    Args:
+        num_pagina:  Número de página (para generar id de imagen).
+        min_img_px:  Tamaño mínimo en px para incluir una imagen.
+    """
+    if encabezados_repetidos is None:
+        encabezados_repetidos = set()
+
     altura = pagina.rect.height
     limite_superior = altura * margen_superior
     limite_inferior = altura * (1 - margen_inferior)
+    umbral_titulo = tamano_cuerpo * factor_titulo
 
-    bloques = pagina.get_text("blocks")  # (x0, y0, x1, y1, texto, ...)
-    lineas_validas = []
+    dic = pagina.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_IMAGES)
 
-    for bloque in bloques:
-        # bloque[3] = y1 (borde inferior del bloque)
-        # bloque[1] = y0 (borde superior del bloque)
-        y_superior = bloque[1]
-        y_inferior = bloque[3]
+    # ── Recopilar elementos ordenados por posición Y ──
+    # Cada elemento: (y_centro, tipo, contenido)
+    elementos: list[tuple[float, str, str]] = []
 
-        # Descartar si el bloque está en la zona de encabezado o pie
-        if y_inferior <= limite_superior:
+    for bloque in dic.get("blocks", []):
+        bbox = bloque["bbox"]
+        y_sup, y_inf = bbox[1], bbox[3]
+
+        if y_inf <= limite_superior or y_sup >= limite_inferior:
             continue
-        if y_superior >= limite_inferior:
+
+        y_centro = (y_sup + y_inf) / 2
+
+        if bloque.get("type", 0) == 1:
+            # Bloque de imagen
+            ancho = bloque.get("width", 0)
+            alto = bloque.get("height", 0)
+            if ancho >= min_img_px and alto >= min_img_px:
+                # Buscar el xref de la imagen más cercana a este bbox
+                img_list = pagina.get_images(full=True)
+                mejor_xref = None
+                mejor_dist = float("inf")
+                for img_info in img_list:
+                    xref = img_info[0]
+                    try:
+                        rects = pagina.get_image_rects(xref)
+                    except Exception:
+                        continue
+                    for r in rects:
+                        dist = abs(r.y0 - y_sup) + abs(r.x0 - bbox[0])
+                        if dist < mejor_dist:
+                            mejor_dist = dist
+                            mejor_xref = xref
+                if mejor_xref is not None:
+                    img_id = f"p{num_pagina:04d}_{mejor_xref}"
+                    elementos.append((y_centro, "img", img_id))
             continue
 
-        # bloque[4] contiene el texto; bloque[6] indica si es imagen (1)
-        if bloque[6] == 0:  # Solo bloques de texto
-            lineas_validas.append(bloque[4].strip())
+        # Bloque de texto
+        for linea in bloque.get("lines", []):
+            textos_linea = []
+            tamano_max = 0.0
+            for span in linea.get("spans", []):
+                texto = span["text"]
+                if texto.strip():
+                    textos_linea.append(texto)
+                    if span["size"] > tamano_max:
+                        tamano_max = span["size"]
 
-    return "\n".join(lineas_validas)
+            texto_completo = "".join(textos_linea).strip()
+            if not texto_completo:
+                continue
+            if texto_completo.isdigit() and len(texto_completo) <= 4:
+                continue
+
+            tiene_palabras = len(re.findall(r"[a-zA-Z\u00c0-\u024f]{2,}", texto_completo)) >= 1
+            es_mayus_decorativo = (
+                texto_completo == texto_completo.upper()
+                and len(texto_completo.split()) <= 2
+            )
+            tiene_chars_raros = bool(re.search(
+                r"[^\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2032-\u2037\u2018-\u201f]",
+                texto_completo
+            ))
+            es_titulo_por_fuente = (
+                tamano_max >= umbral_titulo
+                and len(texto_completo) < 120
+                and tiene_palabras
+                and not es_mayus_decorativo
+                and not tiene_chars_raros
+            )
+
+            y_linea = linea["bbox"][1]
+            if es_titulo_por_fuente:
+                elementos.append((y_linea, "txt", f"## {texto_completo}"))
+            elif texto_completo.lower() in encabezados_repetidos:
+                continue
+            else:
+                elementos.append((y_linea, "txt", texto_completo))
+
+    # Ordenar por posición Y y generar salida
+    elementos.sort(key=lambda e: e[0])
+    lineas_resultado = []
+    for _y, tipo, contenido in elementos:
+        if tipo == "img":
+            lineas_resultado.append(f"{{{{IMG:{contenido}}}}}")
+        else:
+            lineas_resultado.append(contenido)
+
+    return "\n".join(lineas_resultado)
+
+
+def extraer_imagenes_pdf(ruta_pdf: Path,
+                         min_img_px: int = 50) -> dict[str, tuple[bytes, str]]:
+    """
+    Extrae todas las imágenes del PDF que superen el tamaño mínimo.
+
+    Returns:
+        Dict  img_id → (bytes_imagen, extension)
+        donde img_id tiene formato ``pNNNN_xref``.
+    """
+    documento = fitz.open(str(ruta_pdf))
+    imagenes: dict[str, tuple[bytes, str]] = {}
+    cache_xref: dict[int, tuple[bytes, str]] = {}
+
+    for num_pag in range(len(documento)):
+        pagina = documento[num_pag]
+        for img_info in pagina.get_images(full=True):
+            xref = img_info[0]
+            w, h = img_info[2], img_info[3]
+            if w < min_img_px or h < min_img_px:
+                continue
+            img_id = f"p{num_pag:04d}_{xref}"
+            if xref in cache_xref:
+                imagenes[img_id] = cache_xref[xref]
+                continue
+            try:
+                base = documento.extract_image(xref)
+            except Exception:
+                continue
+            ext = base.get("ext", "png")
+            datos = (base["image"], ext)
+            cache_xref[xref] = datos
+            imagenes[img_id] = datos
+
+    documento.close()
+    return imagenes
 
 
 def extraer_texto_pdf(ruta_pdf: Path,
-                      margen_superior: float = 0.06,
-                      margen_inferior: float = 0.06) -> list[str]:
+                      margen_superior: float = 0.08,
+                      margen_inferior: float = 0.08) -> tuple[list[str], dict[str, tuple[bytes, str]]]:
     """
-    Abre un PDF y extrae el texto de cada página como una lista de
-    cadenas, descartando encabezados y pies de página.
+    Abre un PDF y extrae texto + imágenes.
 
     Returns:
-        Lista donde cada elemento es el texto limpio de una página.
+        (paginas_texto, imagenes)
+        - paginas_texto: lista de textos por página con marcas ## e {{IMG:...}}
+        - imagenes: dict img_id → (bytes, ext)
     """
     documento = fitz.open(str(ruta_pdf))
-    paginas_texto = []
 
+    tamano_cuerpo = _calcular_tamano_cuerpo(documento)
+    encabezados_rep = _detectar_encabezados_repetidos(documento)
+
+    paginas_texto = []
     for numero in range(len(documento)):
         pagina = documento[numero]
-        texto = extraer_texto_pagina(pagina, margen_superior, margen_inferior)
+        texto = extraer_texto_pagina(
+            pagina, margen_superior, margen_inferior,
+            tamano_cuerpo=tamano_cuerpo,
+            encabezados_repetidos=encabezados_rep,
+            num_pagina=numero,
+        )
         if texto.strip():
             paginas_texto.append(texto)
 
     documento.close()
-    return paginas_texto
+
+    # Extraer imágenes en pasada separada (más fiable)
+    imagenes = extraer_imagenes_pdf(ruta_pdf)
+
+    return paginas_texto, imagenes
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -140,22 +327,29 @@ def reparar_saltos_de_linea(texto: str) -> str:
 
 def detectar_titulos(texto: str) -> str:
     """
-    Intenta detectar líneas que son títulos o encabezados de capítulo
-    y les asigna formato Markdown (##).
+    Detecta líneas que son títulos o encabezados de capítulo y les
+    asigna formato Markdown (##).  No vuelve a marcar líneas que ya
+    tengan el prefijo ``## `` (insertado durante la extracción por
+    análisis de fuente).
 
-    Heurísticas:
+    Heurísticas adicionales (complementan la detección por fuente):
       - Líneas cortas (< 80 caracteres) completamente en mayúsculas.
-      - Líneas que comienzan con "Capítulo", "CAPÍTULO", "Chapter",
-        "Parte", "Sección", etc.
+      - Líneas que comienzan con palabras clave de capítulo.
+      - Líneas con formato "N  Título" (número + título corto).
     """
     lineas = texto.split("\n")
     resultado = []
 
     patron_capitulo = re.compile(
-        r"^(cap[íi]tulo|chapter|parte|secci[oó]n|introducci[oó]n|"
-        r"conclusi[oó]n|ep[ií]logo|pr[oó]logo|prefacio|ap[eé]ndice)"
-        r"\b",
-        re.IGNORECASE,
+        r"^(Cap[íi]tulo|Chapter|Parte|Secci[oó]n|Introducci[oó]n|"
+        r"Conclusi[oó]n|Ep[ií]logo|Pr[oó]logo|Prefacio|Ap[eé]ndice|"
+        r"Acknowledgements?|Bibliography|Index|Contents)"
+        r"(\s+\d+)?(\s*:\s+.+)?\s*$",
+    )
+
+    # Patrón para títulos numerados: "1 The Reach of Explanations"
+    patron_numerado = re.compile(
+        r"^\d{1,3}\s{1,4}[A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\s',:\-]+$"
     )
 
     for linea in lineas:
@@ -165,16 +359,29 @@ def detectar_titulos(texto: str) -> str:
             resultado.append("")
             continue
 
+        # Ya marcada como título → conservar
+        if linea_limpia.startswith("## "):
+            resultado.append(linea_limpia)
+            continue
+
         es_titulo = False
 
-        # Líneas cortas en mayúsculas → posible título
+        # Líneas cortas en mayúsculas con al menos 2 palabras alfabéticas
+        # (excluir entradas de índice con números como "ENIAC 139")
         if (len(linea_limpia) < 80
                 and linea_limpia == linea_limpia.upper()
-                and re.search(r"[A-ZÁÉÍÓÚÑ]", linea_limpia)):
+                and not re.search(r"\d", linea_limpia)
+                and len(re.findall(r"[A-ZÁÉÍÓÚÑ]{3,}", linea_limpia)) >= 2):
             es_titulo = True
 
-        # Líneas que empiezan con palabras clave de capítulo
+        # Líneas que son exactamente un título de capítulo
+        # (solo cuando comienzan con mayúscula, no mid-sentence)
         if patron_capitulo.match(linea_limpia):
+            es_titulo = True
+
+        # Títulos numerados cortos (ej. "3 The Spark")
+        if (len(linea_limpia) < 80
+                and patron_numerado.match(linea_limpia)):
             es_titulo = True
 
         if es_titulo:
@@ -190,17 +397,45 @@ def limpiar_espacios_multiples(texto: str) -> str:
     return re.sub(r" {2,}", " ", texto)
 
 
+def _proteger_titulos_antes_de_saltos(texto: str) -> str:
+    """
+    Asegura que las líneas marcadas como ``## título`` o placeholders
+    de imagen ``{{IMG:...}}`` tengan un salto doble antes y después,
+    para que ``reparar_saltos_de_linea`` no las fusione con el párrafo
+    adyacente.
+    """
+    lineas = texto.split("\n")
+    resultado = []
+    for linea in lineas:
+        limpia = linea.strip()
+        if limpia.startswith("## ") or limpia.startswith("{{IMG:"):
+            if resultado and resultado[-1].strip():
+                resultado.append("")
+            resultado.append(linea)
+            resultado.append("")
+        else:
+            resultado.append(linea)
+    return "\n".join(resultado)
+
+
 def limpiar_texto(texto_crudo: str) -> str:
     """
     Pipeline completo de limpieza:
       1. Reparar guiones de corte de renglón.
-      2. Reparar saltos de línea rotos (unir párrafos).
-      3. Detectar y marcar títulos con formato Markdown.
-      4. Limpiar espacios múltiples.
+      2. Detectar títulos adicionales con heurísticas de regex.
+      3. Proteger títulos (## ) con saltos dobles.
+      4. Reparar saltos de línea rotos (unir párrafos).
+      5. Limpiar espacios múltiples.
+
+    Nota: los títulos detectados por tamaño de fuente ya vienen
+    marcados desde la extracción (Paso 1).  Aquí se aplican
+    heurísticas adicionales *antes* de unir párrafos, para que
+    los títulos no se fusionen con el texto circundante.
     """
     texto = reparar_guiones_de_corte(texto_crudo)
-    texto = reparar_saltos_de_linea(texto)
     texto = detectar_titulos(texto)
+    texto = _proteger_titulos_antes_de_saltos(texto)
+    texto = reparar_saltos_de_linea(texto)
     texto = limpiar_espacios_multiples(texto)
     return texto.strip()
 
@@ -209,15 +444,23 @@ def limpiar_texto(texto_crudo: str) -> str:
 #  PASO 3 — Generación del EPUB
 # ══════════════════════════════════════════════════════════════════════
 
-def markdown_a_html(texto_md: str) -> str:
+def markdown_a_html(texto_md: str,
+                    imagenes: dict[str, tuple[bytes, str]] | None = None,
+                    ) -> str:
     """
-    Convierte el texto en formato Markdown simplificado a HTML
-    para insertarlo en el EPUB.
+    Convierte el texto en formato Markdown simplificado a HTML.
+    Soporta: títulos ##, párrafos, imágenes {{IMG:id}}.
+    """
+    if imagenes is None:
+        imagenes = {}
+    patron_img = re.compile(r"\{\{IMG:(.+?)\}\}")
 
-    Soporta:
-      - Títulos ##
-      - Párrafos separados por líneas en blanco
-    """
+    def _img_tag(img_id: str) -> str:
+        ext = imagenes.get(img_id, (b"", "png"))[1]
+        return (f'<div class="img-container">'
+                f'<img src="images/{img_id}.{ext}" alt="" />'
+                f'</div>')
+
     lineas = texto_md.split("\n")
     html_partes = []
     parrafo_actual = []
@@ -226,25 +469,78 @@ def markdown_a_html(texto_md: str) -> str:
         if parrafo_actual:
             contenido = " ".join(parrafo_actual).strip()
             if contenido:
+                contenido = patron_img.sub(
+                    lambda m: f'</p>{_img_tag(m.group(1))}<p>',
+                    contenido,
+                )
                 html_partes.append(f"<p>{contenido}</p>")
             parrafo_actual.clear()
 
     for linea in lineas:
         linea = linea.strip()
-
         if not linea:
             cerrar_parrafo()
             continue
-
         if linea.startswith("## "):
             cerrar_parrafo()
-            titulo = linea[3:].strip()
-            html_partes.append(f"<h2>{titulo}</h2>")
+            html_partes.append(f"<h2>{linea[3:].strip()}</h2>")
+        elif patron_img.fullmatch(linea):
+            cerrar_parrafo()
+            html_partes.append(_img_tag(patron_img.fullmatch(linea).group(1)))
         else:
             parrafo_actual.append(linea)
 
     cerrar_parrafo()
     return "\n".join(html_partes)
+
+
+def _consolidar_titulos_consecutivos(texto: str) -> str:
+    """
+    Cuando un capítulo tiene número y nombre en líneas separadas
+    (ej. ``## 1`` seguido de ``## The Reach of Explanations``), los
+    une en un solo título: ``## 1 — The Reach of Explanations``.
+
+    También une títulos de capítulo que se partieron en varias líneas
+    (ej. ``## A Physicist's History of Bad`` seguido de ``## Philosophy``).
+    """
+    lineas = texto.split("\n")
+    resultado = []
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i].strip()
+        if linea.startswith("## "):
+            titulo_actual = linea[3:].strip()
+            # Mirar si la siguiente línea no vacía también es un título
+            j = i + 1
+            while j < len(lineas) and not lineas[j].strip():
+                j += 1
+            if (j < len(lineas)
+                    and lineas[j].strip().startswith("## ")):
+                siguiente = lineas[j].strip()[3:].strip()
+                if titulo_actual.isdigit():
+                    # Unir: "## 1" + "## The Spark" → "## 1 — The Spark"
+                    resultado.append(f"## {titulo_actual} — {siguiente}")
+                    i = j + 1
+                    continue
+                else:
+                    # Unir títulos partidos en varias líneas, solo si
+                    # el primero termina con una palabra que indica
+                    # continuación (preposición, artículo, adjetivo...)
+                    ultima_palabra = titulo_actual.split()[-1].lower()
+                    palabras_continuacion = {
+                        "of", "the", "a", "an", "and", "or", "in", "on",
+                        "for", "to", "with", "by", "at", "from", "as",
+                        "de", "del", "la", "el", "los", "las", "un",
+                        "una", "y", "e", "o", "en", "con", "por", "bad",
+                        "good", "new", "old",
+                    }
+                    if ultima_palabra in palabras_continuacion:
+                        resultado.append(f"## {titulo_actual} {siguiente}")
+                        i = j + 1
+                        continue
+        resultado.append(lineas[i])
+        i += 1
+    return "\n".join(resultado)
 
 
 def dividir_en_capitulos(texto_limpio: str) -> list[dict]:
@@ -257,6 +553,9 @@ def dividir_en_capitulos(texto_limpio: str) -> list[dict]:
           - "titulo": texto del título del capítulo.
           - "contenido": texto Markdown del capítulo (incluye el título).
     """
+    # Consolidar títulos consecutivos (número + nombre)
+    texto_limpio = _consolidar_titulos_consecutivos(texto_limpio)
+
     patron = re.compile(r"^## (.+)$", re.MULTILINE)
     posiciones = [(m.start(), m.group(1)) for m in patron.finditer(texto_limpio)]
 
@@ -308,7 +607,9 @@ def buscar_caratula(nombre_pdf: str) -> Path | None:
 
 
 def crear_epub(titulo_libro: str, capitulos: list[dict],
-               ruta_salida: Path, ruta_caratula: Path | None = None) -> None:
+               ruta_salida: Path, ruta_caratula: Path | None = None,
+               imagenes: dict[str, tuple[bytes, str]] | None = None,
+               ) -> None:
     """
     Crea un archivo EPUB a partir de los capítulos procesados.
 
@@ -317,7 +618,11 @@ def crear_epub(titulo_libro: str, capitulos: list[dict],
         capitulos:      Lista de dicts con "titulo" y "contenido".
         ruta_salida:    Ruta completa del archivo .epub de salida.
         ruta_caratula:  Ruta opcional a una imagen de portada.
+        imagenes:       Dict img_id → (bytes, ext) de imágenes del PDF.
     """
+    if imagenes is None:
+        imagenes = {}
+
     libro = epub.EpubBook()
 
     # ── Metadatos ──
@@ -354,6 +659,15 @@ p {
 p:first-of-type {
     text-indent: 0;
 }
+.img-container {
+    text-align: center;
+    margin: 1.5em 0;
+    page-break-inside: avoid;
+}
+.img-container img {
+    max-width: 100%;
+    height: auto;
+}
 """.encode("utf-8"),
     )
     libro.add_item(estilo_css)
@@ -383,6 +697,23 @@ p:first-of-type {
         libro.set_cover(nombre_portada, contenido_imagen)
         print(f"  📷 Carátula agregada: {ruta_caratula.name}")
 
+    # ── Agregar imágenes extraídas del PDF ──
+    mapa_ext_media = {
+        "jpeg": "image/jpeg", "jpg": "image/jpeg",
+        "png": "image/png", "gif": "image/gif",
+        "bmp": "image/bmp", "tiff": "image/tiff",
+        "jxr": "image/jxr", "jpx": "image/jpx",
+    }
+    for img_id, (img_bytes, ext) in imagenes.items():
+        media = mapa_ext_media.get(ext, f"image/{ext}")
+        item = epub.EpubItem(
+            uid=f"img-{img_id}",
+            file_name=f"images/{img_id}.{ext}",
+            media_type=media,
+            content=img_bytes,
+        )
+        libro.add_item(item)
+
     # ── Crear capítulos EPUB ──
     secciones_epub = []
     tabla_contenido = []
@@ -395,7 +726,7 @@ p:first-of-type {
             lang="es",
         )
 
-        html_contenido = markdown_a_html(capitulo["contenido"])
+        html_contenido = markdown_a_html(capitulo["contenido"], imagenes)
         seccion.content = f"""
 <html>
 <head><link rel="stylesheet" href="style/default.css" /></head>
@@ -425,45 +756,61 @@ p:first-of-type {
 #  Pipeline principal
 # ══════════════════════════════════════════════════════════════════════
 
-def convertir_pdf_a_epub(ruta_pdf: Path) -> None:
+def convertir_pdf_a_epub(ruta_pdf: Path, usar_md_local: bool = False) -> None:
     """
     Ejecuta el pipeline completo para un solo archivo PDF:
       1. Extraer texto (filtrar encabezados/pies).
       2. Limpiar y estructurar con regex.
-      3. Dividir en capítulos.
-      4. Generar EPUB.
+      3. Guardar en carpeta md/ (y permitir cargar desde ahí).
+      4. Dividir en capítulos.
+      5. Generar EPUB.
     """
     nombre = ruta_pdf.stem
     print(f"\n{'─' * 60}")
-    print(f"  📖 Procesando: {ruta_pdf.name}")
+    print(f"  📖 Procesando: {nombre}")
     print(f"{'─' * 60}")
 
-    # Paso 1: Extracción
-    print("  ⏳ Extrayendo texto del PDF...")
-    paginas = extraer_texto_pdf(ruta_pdf)
+    ruta_md = DIRECTORIO_MD / f"{nombre}.md"
 
-    if not paginas:
-        print("  ⚠️  No se pudo extraer texto. El PDF puede ser solo imágenes.")
-        return
+    if usar_md_local and ruta_md.exists():
+        print(f"  ⏳ Leyendo texto editado desde: {ruta_md.name}")
+        texto_limpio = ruta_md.read_text(encoding="utf-8")
+        
+        print("  ⏳ Extrayendo solo imágenes del PDF...")
+        imagenes = extraer_imagenes_pdf(ruta_pdf)
+        print(f"  ✅ {len(imagenes)} imagen(es) encontrada(s).")
+    else:
+        # Paso 1: Extracción
+        print("  ⏳ Extrayendo texto e imágenes del PDF...")
+        paginas, imagenes = extraer_texto_pdf(ruta_pdf)
 
-    print(f"  ✅ {len(paginas)} páginas extraídas.")
+        if not paginas:
+            print("  ⚠️  No se pudo extraer texto. El PDF puede ser solo imágenes.")
+            return
 
-    # Paso 2: Limpieza
-    print("  ⏳ Limpiando y estructurando texto...")
-    texto_completo = "\n\n".join(paginas)
-    texto_limpio = limpiar_texto(texto_completo)
+        print(f"  ✅ {len(paginas)} páginas extraídas, {len(imagenes)} imagen(es) encontrada(s).")
 
-    # Paso 3: Dividir en capítulos
+        # Paso 2: Limpieza
+        print("  ⏳ Limpiando y estructurando texto...")
+        texto_completo = "\n\n".join(paginas)
+        texto_limpio = limpiar_texto(texto_completo)
+
+        # Paso 3: Guardar Markdown
+        DIRECTORIO_MD.mkdir(parents=True, exist_ok=True)
+        ruta_md.write_text(texto_limpio, encoding="utf-8")
+        print(f"  ✅ Archivo Markdown guardado en: md/{ruta_md.name}")
+
+    # Paso 4: Dividir en capítulos
     capitulos = dividir_en_capitulos(texto_limpio)
     print(f"  ✅ {len(capitulos)} capítulo(s) detectado(s).")
 
     # Buscar carátula opcional
     caratula = buscar_caratula(ruta_pdf.name)
 
-    # Paso 4: Generar EPUB
+    # Paso 5: Generar EPUB
     ruta_salida = DIRECTORIO_SALIDA / f"{nombre}.epub"
     print(f"  ⏳ Generando EPUB...")
-    crear_epub(nombre, capitulos, ruta_salida, caratula)
+    crear_epub(nombre, capitulos, ruta_salida, caratula, imagenes)
     print(f"  ✅ EPUB guardado: {ruta_salida}")
 
 
@@ -477,27 +824,37 @@ def main():
       3. Sin nada → convierte todos los PDF en PDF/
     """
     # ── Poner aquí la ruta del PDF a convertir (nombre o ruta completa) ──
-    RUTA_PDF = "El acto de crear - Rick Rubin.pdf"  # Ejemplo: "El acto de crear - Rick Rubin.pdf"
+    RUTA_PDF = "The Beginning of Infinity ( PDFDrive ).pdf"  # Ejemplo: "El acto de crear - Rick Rubin.pdf"
 
-    if RUTA_PDF:
-        argumento = RUTA_PDF
-    elif len(sys.argv) > 1:
+    if len(sys.argv) > 1:
         argumento = sys.argv[1]
+    elif RUTA_PDF:
+        argumento = RUTA_PDF
     else:
         argumento = ""
 
     if argumento:
         ruta = Path(argumento)
 
-        # Si es solo un nombre de archivo, buscarlo en la carpeta PDF/
+        # Si es solo un nombre de archivo, buscarlo en la carpeta PDF/ o md/
         if not ruta.is_absolute() and not ruta.exists():
-            ruta = DIRECTORIO_PDF / argumento
+            if ruta.suffix.lower() == ".md":
+                ruta = DIRECTORIO_MD / argumento
+            else:
+                ruta = DIRECTORIO_PDF / argumento
 
         if not ruta.exists():
             print(f"❌ Archivo no encontrado: {ruta}")
             sys.exit(1)
 
-        convertir_pdf_a_epub(ruta)
+        if ruta.suffix.lower() == ".md":
+            ruta_pdf = DIRECTORIO_PDF / f"{ruta.stem}.pdf"
+            if not ruta_pdf.exists():
+                print(f"❌ No se encontró el PDF correspondiente: {ruta_pdf}")
+                sys.exit(1)
+            convertir_pdf_a_epub(ruta_pdf, usar_md_local=True)
+        else:
+            convertir_pdf_a_epub(ruta)
     else:
         # Convertir todos los PDFs en la carpeta
         archivos_pdf = sorted(DIRECTORIO_PDF.glob("*.pdf"))

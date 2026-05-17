@@ -17,3 +17,4 @@ epub-mobi/
 caratulas/
 contenido_extraido/
 temp_kindle_conversion/
+__pycache__/
