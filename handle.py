@@ -113,11 +113,13 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                          encabezados_repetidos: set[str] | None = None,
                          num_pagina: int = 0,
                          min_img_px: int = 50,
-                         ) -> tuple[list[tuple[str, str, float, bool]], float]:
+                         seccion_actual: str | None = None,
+                         ) -> tuple[list[tuple[str, str, float, bool]], float, str | None]:
     """
     Extrae elementos crudos de la página junto con el margen base.
-    Devuelve: (lista_de_elementos, base_x0)
+    Devuelve: (lista_de_elementos, base_x0, seccion_actual)
     Cada elemento es: (tipo, contenido, x0, es_titulo)
+    seccion_actual se propaga entre páginas para secciones multi-página.
     """
     if encabezados_repetidos is None:
         encabezados_repetidos = set()
@@ -132,13 +134,20 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
 
     elementos_raw = []
 
+    # Para identificar secciones especiales de forma secuencial y aplicar formato
+    # Ordenamos primero todos los bloques verticalmente
+    bloques_validos = []
     for bloque in dic.get("blocks", []):
         bbox = bloque["bbox"]
         y_sup, y_inf = bbox[1], bbox[3]
-
         if y_inf <= limite_superior or y_sup >= limite_inferior:
             continue
+        bloques_validos.append(bloque)
+        
+    bloques_validos.sort(key=lambda b: b["bbox"][1])
 
+    for bloque in bloques_validos:
+        y_sup, y_inf = bloque["bbox"][1], bloque["bbox"][3]
         y_centro = (y_sup + y_inf) / 2
 
         if bloque.get("type", 0) == 1:
@@ -153,7 +162,7 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                     try: rects = pagina.get_image_rects(xref)
                     except Exception: continue
                     for r in rects:
-                        dist = abs(r.y0 - y_sup) + abs(r.x0 - bbox[0])
+                        dist = abs(r.y0 - y_sup) + abs(r.x0 - bloque["bbox"][0])
                         if dist < mejor_dist:
                             mejor_dist = dist
                             mejor_xref = xref
@@ -162,15 +171,20 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                     elementos_raw.append((y_centro, "img", f"{{{{IMG:{img_id}}}}}", 0.0, False))
             continue
 
-        for linea in bloque.get("lines", []):
+        # Ordenar líneas del bloque verticalmente
+        lineas = list(bloque.get("lines", []))
+        lineas.sort(key=lambda l: l["bbox"][1])
+
+        for linea in lineas:
             textos_linea = []
             tamano_max = 0.0
-            for span in linea.get("spans", []):
+            spans_validos = [s for s in linea.get("spans", []) if s["text"].strip()]
+            
+            for span in spans_validos:
                 texto = span["text"]
-                if texto.strip():
-                    textos_linea.append(texto)
-                    if span["size"] > tamano_max:
-                        tamano_max = span["size"]
+                textos_linea.append(texto)
+                if span["size"] > tamano_max:
+                    tamano_max = span["size"]
 
             texto_completo = "".join(textos_linea).strip()
             if not texto_completo:
@@ -187,6 +201,16 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
             x0_linea = linea["bbox"][0]
             y_linea = linea["bbox"][1]
             
+            # Detectar y actualizar el estado de sección actual si se encuentra un título/subtítulo
+            if es_titulo_por_fuente or es_subtitulo_por_fuente:
+                texto_limpio_para_seccion = texto_completo.lower()
+                if "terminology" in texto_limpio_para_seccion:
+                    seccion_actual = "glossary"
+                elif "meanings of" in texto_limpio_para_seccion:
+                    seccion_actual = "bullets"
+                elif "summary" in texto_limpio_para_seccion or "chapter" in texto_limpio_para_seccion or "capítulo" in texto_limpio_para_seccion:
+                    seccion_actual = None
+
             if es_titulo_por_fuente:
                 elementos_raw.append((y_linea, "titulo", f"## {texto_completo}", x0_linea, True))
             elif es_subtitulo_por_fuente:
@@ -194,19 +218,73 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
             elif texto_completo.lower() in encabezados_repetidos:
                 continue
             else:
+                # Aplicar formato especial según la sección
+                if seccion_actual == "glossary" and spans_validos:
+                    # Comprobar si el primer span es cursiva (italic/oblique)
+                    primer_span = spans_validos[0]
+                    font_name = primer_span.get("font", "").lower()
+                    es_italic = "italic" in font_name or "oblique" in font_name
+                    
+                    if es_italic:
+                        spans_term = []
+                        spans_def = []
+                        en_definicion = False
+                        
+                        for s in spans_validos:
+                            f_name = s.get("font", "").lower()
+                            s_italic = "italic" in f_name or "oblique" in f_name
+                            if not en_definicion and s_italic:
+                                spans_term.append(s["text"])
+                            else:
+                                en_definicion = True
+                                spans_def.append(s["text"])
+                                
+                        term_text = "".join(spans_term).strip("* :")
+                        def_text = "".join(spans_def).strip()
+                        
+                        if term_text:
+                            # Formatear: "**Term**: Definition" (si hay definición)
+                            if def_text:
+                                texto_completo = f"**{term_text}**: {def_text}"
+                            else:
+                                texto_completo = f"**{term_text}**"
+                    
+                elif seccion_actual == "bullets":
+                    # Estandarizar bullet a "-" solo si realmente empieza con un carácter de viñeta
+                    if texto_completo.startswith(("–", "-", "•", "\u2022")):
+                        texto_limpio = re.sub(r"^[–\-•\u2022]\s*", "", texto_completo).strip()
+                        texto_completo = f"- {texto_limpio}"
+
                 elementos_raw.append((y_linea, "txt", texto_completo, x0_linea, False))
 
     # Ordenar verticalmente los elementos de esta página
     elementos_raw.sort(key=lambda e: e[0])
     
+    # Unificar subtítulos partidos de 'meanings of...'
+    elementos_procesados = []
+    i = 0
+    while i < len(elementos_raw):
+        y, tipo, contenido, x0, es_titulo = elementos_raw[i]
+        if tipo == "titulo" and "meanings of" in contenido.lower() and i + 1 < len(elementos_raw):
+            sig_y, sig_tipo, sig_contenido, sig_x0, sig_es_titulo = elementos_raw[i+1]
+            if sig_tipo == "titulo" and "encountered in" in sig_contenido.lower():
+                cont1 = contenido.replace("### ", "").replace("## ", "").strip()
+                cont2 = sig_contenido.replace("### ", "").replace("## ", "").strip()
+                contenido_unificado = f"### {cont1} {cont2}"
+                elementos_procesados.append((y, "titulo", contenido_unificado, x0, es_titulo))
+                i += 2
+                continue
+        elementos_procesados.append(elementos_raw[i])
+        i += 1
+
     # Calcular el margen base izquierdo de ESTA página
-    lineas_cuerpo = [e for e in elementos_raw if e[1] == "txt" and not e[4] and len(e[2]) > 15]
+    lineas_cuerpo = [e for e in elementos_procesados if e[1] == "txt" and not e[4] and len(e[2]) > 15]
     base_x0 = min([e[3] for e in lineas_cuerpo]) if lineas_cuerpo else 0.0
 
     # Limpiar la tupla para devolver solo lo necesario: (tipo, contenido, x0, es_titulo)
-    elementos_finales = [(e[1], e[2], e[3], e[4]) for e in elementos_raw]
+    elementos_finales = [(e[1], e[2], e[3], e[4]) for e in elementos_procesados]
 
-    return elementos_finales, base_x0
+    return elementos_finales, base_x0, seccion_actual
 
 
 def extraer_imagenes_pdf(ruta_pdf: Path,
@@ -263,26 +341,44 @@ def extraer_texto_pdf(ruta_pdf: Path,
     # Aquí acumularemos los elementos de TODO el libro en orden continuo
     # Formato de la tupla: (tipo, contenido, es_sangria)
     flujo_global_elementos = []
+    seccion_actual_pdf = None
     
     for numero in range(len(documento)):
         pagina = documento[numero]
-        elementos_pag, base_x0 = extraer_texto_pagina(
+        elementos_pag, base_x0, _ = extraer_texto_pagina(
             pagina, margen_superior, margen_inferior,
             tamano_cuerpo=tamano_cuerpo,
             factor_titulo=factor_titulo,
             factor_subtitulo=factor_subtitulo,
             encabezados_repetidos=encabezados_rep,
             num_pagina=numero,
+            seccion_actual=seccion_actual_pdf,
         )
         
         # Procesamos los elementos de la página usando su propio base_x0
         for tipo, contenido, x0, es_titulo in elementos_pag:
-            if tipo == "txt":
-                umbral_sangria = 8.0
-                es_sangria = (x0 - base_x0) > umbral_sangria
+            if tipo == "titulo":
+                texto_limpio_titulo = contenido.lower()
+                if "terminology" in texto_limpio_titulo:
+                    seccion_actual_pdf = "glossary"
+                elif "meanings of" in texto_limpio_titulo:
+                    seccion_actual_pdf = "bullets"
+                elif "summary" in texto_limpio_titulo or "chapter" in texto_limpio_titulo or "capítulo" in texto_limpio_titulo:
+                    seccion_actual_pdf = None
+                flujo_global_elementos.append((tipo, contenido, False))
+            elif tipo == "txt":
+                contenido_limpio = contenido.strip()
+                if seccion_actual_pdf == "glossary":
+                    # Un elemento de glosario solo es un nuevo término si empieza con '**'
+                    es_sangria = contenido_limpio.startswith("**")
+                elif seccion_actual_pdf == "bullets":
+                    # Un elemento de viñetas solo es una nueva frase si empieza con '- '
+                    es_sangria = contenido_limpio.startswith("- ")
+                else:
+                    umbral_sangria = 8.0
+                    es_sangria = (x0 - base_x0) > umbral_sangria
                 flujo_global_elementos.append((tipo, contenido, es_sangria))
             else:
-                # Títulos e imágenes no requieren cálculo de sangría
                 flujo_global_elementos.append((tipo, contenido, False))
 
     documento.close()
