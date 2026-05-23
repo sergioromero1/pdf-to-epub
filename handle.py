@@ -109,6 +109,7 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
                          margen_inferior: float,
                          tamano_cuerpo: float = 10.0,
                          factor_titulo: float = 1.4,
+                         factor_subtitulo: float = 1.12,
                          encabezados_repetidos: set[str] | None = None,
                          num_pagina: int = 0,
                          min_img_px: int = 50,
@@ -125,6 +126,7 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
     limite_superior = altura * margen_superior
     limite_inferior = altura * (1 - margen_inferior)
     umbral_titulo = tamano_cuerpo * factor_titulo
+    umbral_subtitulo = tamano_cuerpo * factor_subtitulo
 
     dic = pagina.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_IMAGES)
 
@@ -180,12 +182,15 @@ def extraer_texto_pagina(pagina: fitz.Page, margen_superior: float,
             es_mayus_decorativo = (texto_completo == texto_completo.upper() and len(texto_completo.split()) <= 2)
             tiene_chars_raros = bool(re.search(r"[^\x20-\x7e\u00a0-\u024f\u2010-\u2027\u2032-\u2037\u2018-\u201f]", texto_completo))
             es_titulo_por_fuente = (tamano_max >= umbral_titulo and len(texto_completo) < 120 and tiene_palabras and not es_mayus_decorativo and not tiene_chars_raros)
+            es_subtitulo_por_fuente = (umbral_subtitulo <= tamano_max < umbral_titulo and len(texto_completo) < 120 and tiene_palabras and not es_mayus_decorativo and not tiene_chars_raros)
 
             x0_linea = linea["bbox"][0]
             y_linea = linea["bbox"][1]
             
             if es_titulo_por_fuente:
                 elementos_raw.append((y_linea, "titulo", f"## {texto_completo}", x0_linea, True))
+            elif es_subtitulo_por_fuente:
+                elementos_raw.append((y_linea, "titulo", f"### {texto_completo}", x0_linea, True))
             elif texto_completo.lower() in encabezados_repetidos:
                 continue
             else:
@@ -243,7 +248,9 @@ def extraer_imagenes_pdf(ruta_pdf: Path,
 
 def extraer_texto_pdf(ruta_pdf: Path,
                       margen_superior: float = 0.08,
-                      margen_inferior: float = 0.08) -> tuple[list[str], dict[str, tuple[bytes, str]]]:
+                      margen_inferior: float = 0.08,
+                      factor_titulo: float = 1.4,
+                      factor_subtitulo: float = 1.12) -> tuple[list[str], dict[str, tuple[bytes, str]]]:
     """
     Abre un PDF, une todas las páginas de forma fluida resolviendo cortes 
     de párrafo en saltos de página, y extrae las imágenes.
@@ -262,6 +269,8 @@ def extraer_texto_pdf(ruta_pdf: Path,
         elementos_pag, base_x0 = extraer_texto_pagina(
             pagina, margen_superior, margen_inferior,
             tamano_cuerpo=tamano_cuerpo,
+            factor_titulo=factor_titulo,
+            factor_subtitulo=factor_subtitulo,
             encabezados_repetidos=encabezados_rep,
             num_pagina=numero,
         )
@@ -385,8 +394,8 @@ def detectar_titulos(texto: str) -> str:
             resultado.append("")
             continue
 
-        # Ya marcada como título → conservar
-        if linea_limpia.startswith("## "):
+        # Ya marcada como título o subtítulo → conservar
+        if linea_limpia.startswith("## ") or linea_limpia.startswith("### "):
             resultado.append(linea_limpia)
             continue
 
@@ -434,7 +443,7 @@ def _proteger_titulos_antes_de_saltos(texto: str) -> str:
     resultado = []
     for linea in lineas:
         limpia = linea.strip()
-        if limpia.startswith("## ") or limpia.startswith("{{IMG:"):
+        if limpia.startswith("## ") or limpia.startswith("### ") or limpia.startswith("{{IMG:"):
             if resultado and resultado[-1].strip():
                 resultado.append("")
             resultado.append(linea)
@@ -572,6 +581,33 @@ def _consolidar_titulos_consecutivos(texto: str) -> str:
     return "\n".join(resultado)
 
 
+def _consolidar_subtitulos_consecutivos(texto: str) -> str:
+    """
+    Une subtítulos (###) consecutivos que se partieron en varias líneas.
+    """
+    lineas = texto.split("\n")
+    resultado = []
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i].strip()
+        if linea.startswith("### "):
+            sub_actual = linea[4:].strip()
+            j = i + 1
+            while j < len(lineas) and not lineas[j].strip():
+                j += 1
+            if (j < len(lineas)
+                    and lineas[j].strip().startswith("### ")):
+                siguiente = lineas[j].strip()[4:].strip()
+                if (sub_actual.lower() not in {"summary", "terminology", "contents"}
+                        and not sub_actual.endswith((".", "?", "!", ":"))):
+                    resultado.append(f"### {sub_actual} {siguiente}")
+                    i = j + 1
+                    continue
+        resultado.append(lineas[i])
+        i += 1
+    return "\n".join(resultado)
+
+
 def dividir_en_capitulos(texto_limpio: str) -> list[dict]:
     """
     Divide el texto limpio en capítulos usando los títulos (##) como
@@ -582,8 +618,9 @@ def dividir_en_capitulos(texto_limpio: str) -> list[dict]:
           - "titulo": texto del título del capítulo.
           - "contenido": texto Markdown del capítulo (incluye el título).
     """
-    # Consolidar títulos consecutivos (número + nombre)
+    # Consolidar títulos y subtítulos consecutivos
     texto_limpio = _consolidar_titulos_consecutivos(texto_limpio)
+    texto_limpio = _consolidar_subtitulos_consecutivos(texto_limpio)
 
     patron = re.compile(r"^## (.+)$", re.MULTILINE)
     posiciones = [(m.start(), m.group(1)) for m in patron.finditer(texto_limpio)]
@@ -679,6 +716,12 @@ h2 {
     color: #2c3e50;
     border-bottom: 1px solid #ccc;
     padding-bottom: 0.3em;
+}
+h3 {
+    font-size: 1.2em;
+    margin-top: 1.5em;
+    margin-bottom: 0.4em;
+    color: #34495e;
 }
 p {
     text-align: justify;
